@@ -5,7 +5,7 @@ Usage:
     python main.py proposal.pdf
 
 Environment variables (or .env file):
-    ANTHROPIC_API_KEY   Claude API key
+    ANTHROPIC_API_KEY   Claude API key (optional — falls back to Claude CLI if not set)
     GITHUB_TOKEN        GitHub personal access token (needs repo + project scopes)
     GITHUB_ORG          GitHub organisation (default: conectian)
 """
@@ -87,7 +87,7 @@ def main():
     )
     args = parser.parse_args()
 
-    anthropic_key = _require_env("ANTHROPIC_API_KEY")
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     github_token  = _require_env("GITHUB_TOKEN")
     org = args.org or _require_env("GITHUB_ORG")
 
@@ -98,7 +98,7 @@ def main():
 
     # ── 1. Analyze PDF ────────────────────────────────────────────────────────
     print(f"\n📄 Analyzing {pdf_path.name}...")
-    analyzer = PDFAnalyzer(api_key=anthropic_key)
+    analyzer = PDFAnalyzer(api_key=anthropic_key or None)
     project_data = analyzer.analyze(str(pdf_path))
 
     print(f"\n✅ Extracted project: {project_data.project_name} ({project_data.client_name})")

@@ -1,15 +1,21 @@
 """
 PDF analyzer — sends the proposal PDF to Claude and returns structured ProjectData.
+
+Two backends:
+  1. Anthropic SDK  — when ANTHROPIC_API_KEY is set (or api_key passed explicitly)
+  2. Claude CLI     — falls back to `claude -p` (Claude Code Max OAuth session)
 """
 
 import base64
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
-
-import anthropic
 
 
 # ─── Data models ─────────────────────────────────────────────────────────────
@@ -155,16 +161,50 @@ Create one dev task per logical feature group (not one per bullet point).
 # ─── Analyzer class ───────────────────────────────────────────────────────────
 
 class PDFAnalyzer:
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-6"):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, api_key: str = None, model: str = "claude-sonnet-4-6"):
         self.model = model
+        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._use_sdk = bool(self._api_key)
+
+        if self._use_sdk:
+            import anthropic as _anthropic
+            self._client = _anthropic.Anthropic(api_key=self._api_key)
+        else:
+            self._claude_bin = shutil.which("claude") or self._find_claude_bin()
+            if not self._claude_bin:
+                raise RuntimeError(
+                    "No ANTHROPIC_API_KEY found and `claude` CLI not in PATH. "
+                    "Set ANTHROPIC_API_KEY or install Claude Code."
+                )
+            print(f"  No API key found — using Claude CLI: {self._claude_bin}")
+
+    @staticmethod
+    def _find_claude_bin() -> str | None:
+        exts = Path.home() / ".vscode" / "extensions"
+        if exts.exists():
+            for p in sorted(exts.glob("anthropic.claude-code-*/resources/native-binary/claude"), reverse=True):
+                if p.exists():
+                    return str(p)
+        return None
 
     def analyze(self, pdf_path: str) -> ProjectData:
+        if self._use_sdk:
+            raw = self._analyze_via_sdk(pdf_path)
+        else:
+            raw = self._analyze_via_cli(pdf_path)
+
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        return self._parse(data)
+
+    def _analyze_via_sdk(self, pdf_path: str) -> str:
         pdf_bytes = Path(pdf_path).read_bytes()
         pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
 
-        print(f"  Sending PDF to Claude ({self.model})...")
-        message = self.client.messages.create(
+        print(f"  Sending PDF to Claude API ({self.model})...")
+        message = self._client.messages.create(
             model=self.model,
             max_tokens=8192,
             system=SYSTEM_PROMPT,
@@ -180,22 +220,58 @@ class PDFAnalyzer:
                                 "data": pdf_b64,
                             },
                         },
-                        {
-                            "type": "text",
-                            "text": ANALYSIS_PROMPT,
-                        },
+                        {"type": "text", "text": ANALYSIS_PROMPT},
                     ],
                 }
             ],
         )
+        return message.content[0].text
 
-        raw = message.content[0].text.strip()
-        # Strip accidental markdown fences
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
+    def _analyze_via_cli(self, pdf_path: str) -> str:
+        # Extract PDF text so the CLI can read it
+        pdf_text = self._extract_pdf_text(pdf_path)
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"===PDF CONTENT===\n{pdf_text}\n===END PDF===\n\n"
+            f"{ANALYSIS_PROMPT}"
+        )
 
-        data = json.loads(raw)
-        return self._parse(data)
+        print(f"  Sending PDF to Claude CLI (Max account)...")
+        result = subprocess.run(
+            [self._claude_bin, "-p", "--output-format", "text",
+             "--dangerously-skip-permissions"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Claude CLI failed: {result.stderr[:500]}")
+        return result.stdout
+
+    @staticmethod
+    def _extract_pdf_text(pdf_path: str) -> str:
+        # Try pypdf first, then pdftotext binary
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(pdf_path)
+            return "\n\n".join(
+                page.extract_text() or "" for page in reader.pages
+            )
+        except ImportError:
+            pass
+
+        result = subprocess.run(
+            ["pdftotext", pdf_path, "-"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return result.stdout
+
+        raise RuntimeError(
+            "Cannot extract PDF text: install pypdf (`pip install pypdf`) "
+            "or pdftotext (`apt install poppler-utils`)."
+        )
 
     def _parse(self, data: dict) -> ProjectData:
         modules = []
